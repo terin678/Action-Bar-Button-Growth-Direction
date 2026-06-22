@@ -1,67 +1,20 @@
 -- SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 -- Copyright (c) 2023-2026 Thomas Floeren
+--
+-- Personal Anniversary/Classic build with a native Settings panel and
+-- independent per-bar vertical/horizontal invert toggles.
+-- Diverges from upstream (which is config-file only).
 
-local MYNAME, _ = ...
+local ADDON, NS = ...
 
 local DB_VERSION = 1
--- local debug = true
-
-local function dprint(...)
-	if debug then print(MYNAME, 'DEBUG:', ...) end
-end
 
 --[[===========================================================================
-	Init
+	Bar map / labels
 ===========================================================================]]--
 
-local defaults = {
-	db_version = DB_VERSION,
-	method = 1,
-	enable = { y = 'some', x = 'none' },
-	y = {
-		[1] = true,
-		[2] = false,
-		[3] = false,
-		[4] = false,
-		[5] = false,
-		[6] = false,
-		[7] = false,
-		[8] = false,
--- 		[9] = false,
--- 		[10] = false,
-	},
-	x = {
-		[1] = false,
-		[2] = false,
-		[3] = false,
-		[4] = false,
-		[5] = false,
-		[6] = false,
-		[7] = false,
-		[8] = false,
--- 		[9] = false,
--- 		[10] = false,
-	},
-}
-
--- We have `LoadSavedVariablesFirst: 1`
-
-if type(ABBGD_db) ~= 'table' or ABBGD_db.db_version ~= DB_VERSION then
-	ABBGD_db = defaults
-end
-
--- No db merge needed ATM
-
-local db = ABBGD_db
-
---[[===========================================================================
-	Main
-===========================================================================]]--
-
-local modified = {}
+-- Index order matches Blizzard's action bar numbering in the options UI.
 local map = {
-	-- updated to match Blizzard's current frame name (MainActionBar) while
-	-- keeping a fallback resolver for older clients using MainMenuBar.
 	[1] = 'MainActionBar', -- previously MainMenuBar
 	[2] = 'MultiBarBottomLeft',
 	[3] = 'MultiBarBottomRight',
@@ -70,146 +23,172 @@ local map = {
 	[6] = 'MultiBar5',
 	[7] = 'MultiBar6',
 	[8] = 'MultiBar7',
-	-- Stance and Pet cause problems with 12.0 prepatch
-	-- Any missing mapping should be handled gracefully by modify_bars()
-	-- The taint gets refused by functions inside Blizz's ActionBarController.lua
-	-- https://www.townlong-yak.com/framexml/live/Blizzard_ActionBarController/ActionBarController.lua
-	-- Method 2 fails also (different error).
-	-- Pet bar is probably safe, but we are in prepatch, so wait.
--- 	[9] = 'StanceBar',
--- 	[10] = 'PetActionBar',
+}
+NS.map = map
+
+NS.labels = {
+	[1] = 'Action Bar 1 (Main)',
+	[2] = 'Action Bar 2 (Bottom Left)',
+	[3] = 'Action Bar 3 (Bottom Right)',
+	[4] = 'Action Bar 4 (Right)',
+	[5] = 'Action Bar 5 (Left)',
+	[6] = 'Action Bar 6',
+	[7] = 'Action Bar 7',
+	[8] = 'Action Bar 8',
 }
 
--- Fallbacks for frames that were renamed in recent client patches
-local fallback_map = {
-	-- known rename: MainMenuBar -> MainActionBar. Add both directions so we can
-	-- resolve either name on older or newer clients.
+--[[===========================================================================
+	DB init (we have `LoadSavedVariablesFirst: 1`)
+
+	Schema matches the original project: per-bar axis tables, where
+		y[idx] -> invert vertical growth   (addButtonsToTop)
+		x[idx] -> invert horizontal growth (addButtonsToRight)
+	Keeping these names (and db_version) means existing SavedVariables load
+	directly, with no migration needed.
+===========================================================================]]--
+
+local defaults = {
+	db_version = DB_VERSION,
+	-- Original project intent: invert vertical growth on Bar 1 only.
+	y = { [1]=true, [2]=false,[3]=false,[4]=false,[5]=false,[6]=false,[7]=false,[8]=false },
+	x = { [1]=false,[2]=false,[3]=false,[4]=false,[5]=false,[6]=false,[7]=false,[8]=false },
+}
+
+if type(ABBGD_db) ~= 'table' or ABBGD_db.db_version ~= DB_VERSION then
+	ABBGD_db = CopyTable(defaults)
+end
+
+local db = ABBGD_db
+db.y = db.y or {} -- defensive; older files always had both
+db.x = db.x or {}
+NS.db = db
+
+--[[===========================================================================
+	Frame resolution
+===========================================================================]]--
+
+-- Fallback for the MainMenuBar -> MainActionBar rename on newer clients.
+local fallback = {
 	['MainMenuBar'] = 'MainActionBar',
 	['MainActionBar'] = 'MainMenuBar',
 }
 
-local function resolve_bar_name(name)
-	if type(name) ~= 'string' then return nil end
-	if _G[name] then return name end
-	if fallback_map[name] and _G[fallback_map[name]] then return fallback_map[name] end
-	-- Generic substitution in case of simple renames
-	local alt = name:gsub('MainMenuBar', 'MainActionBar')
-	if alt ~= name and _G[alt] then return alt end
+local function get_frame(name)
+	if _G[name] then return _G[name] end
+	if fallback[name] and _G[fallback[name]] then return _G[fallback[name]] end
 	return nil
 end
 
--- Try to resolve a frame from either a name or an existing frame object.
--- Returns: frame, resolvedName
-local function try_get_frame(name_or_frame)
-	if type(name_or_frame) == 'table' then
-		-- already a frame-like object; try to get its name if available
-		local ok_name = nil
-		if type(name_or_frame.GetName) == 'function' then
-			ok_name = name_or_frame:GetName()
-		end
-		return name_or_frame, ok_name
-	end
-	if type(name_or_frame) ~= 'string' then
-		return nil, nil
-	end
-	local resolved = resolve_bar_name(name_or_frame) or name_or_frame
-	local frame = _G[resolved]
-	if frame then
-		return frame, resolved
-	end
-	return nil, nil
+--[[===========================================================================
+	Apply engine
+
+	`stateV`/`stateH` track whether each bar is currently flipped on that axis
+	relative to Blizzard's base layout, so `apply_one` is idempotent for live
+	toggling. `reassert` resets the tracked base (called on the base-assured
+	triggers: zone load, leaving Edit Mode).
+
+	Auto-correct: `apply_one` records the flag values it leaves behind, and a
+	read-only hook on each bar's `UpdateGridLayout` notices when Blizzard later
+	overwrites them (e.g. Edit Mode). The correction is *deferred* to the next
+	frame via C_Timer, so it runs on a fresh, non-re-entrant call stack (never
+	inside the hook) — which is what makes it safe. It self-converges: once the
+	flags match what we recorded, the hook schedules nothing further.
+===========================================================================]]--
+
+local stateV, stateH = {}, {}
+local hooked = {}
+
+-- Forward declarations (these three reference each other).
+local apply_one, watch, schedule_fix
+
+-- Deferred, non-re-entrant correction: runs after the detection hook returns.
+function schedule_fix(frame, idx)
+	if frame.__abbgd_fix then return end
+	if not (C_Timer and C_Timer.After) then return end
+	frame.__abbgd_fix = true
+	C_Timer.After(0, function()
+		frame.__abbgd_fix = nil
+		if InCombatLockdown() then return end -- protected SetPoint; retried on next relayout
+		-- Blizzard rewrote the flags; treat the current values as its fresh base.
+		stateV[idx] = false
+		stateH[idx] = false
+		apply_one(idx)
+	end)
 end
 
-local reverse_growth = {
-	-- Accepts: axis, frame, opt_name
-	[1] = function(axis, frame, opt_name)
-		if not frame then
-			dprint('reverse_growth[1]: frame not found', tostring(opt_name))
-			return
+-- Read-only detection hook: notices when Blizzard overwrites our flags.
+function watch(frame, idx)
+	if hooked[frame] then return end
+	hooked[frame] = true
+	hooksecurefunc(frame, 'UpdateGridLayout', function(self)
+		if self.__abbgd_top == nil then return end -- not managed yet
+		if self.addButtonsToTop ~= self.__abbgd_top
+			or self.addButtonsToRight ~= self.__abbgd_right then
+			schedule_fix(self, idx)
 		end
-		if axis == 'y' then
-			frame.addButtonsToTop = not frame.addButtonsToTop
-		else
-			frame.addButtonsToRight = not frame.addButtonsToRight
-		end
-	end,
-	[2] = function(axis, frame, opt_name)
-		if not frame then
-			dprint('reverse_growth[2]: frame not found', tostring(opt_name))
-			return
-		end
-		if axis == 'y' then
-			hooksecurefunc(frame, 'UpdateGridLayout', function(self)
-				self.addButtonsToTop = not self.addButtonsToTop
-			end)
-		else
-			hooksecurefunc(frame, 'UpdateGridLayout', function(self)
-				self.addButtonsToRight = not self.addButtonsToRight
-			end)
-		end
-	end,
-}
-
-local function modify_bars()
-	for axis, enableaxis in pairs(db.enable) do
-		if enableaxis ~= 'none' then
-			local bars = db[axis]
-			if type(bars) == 'table' then
-				for idx, enablebar in pairs(bars) do
-					if enableaxis == 'all' or enablebar then
-						local bar_name = map[idx]
-						local frame, resolved = try_get_frame(bar_name)
-						if frame then
-							reverse_growth[db.method](axis, frame, resolved or bar_name)
-							-- Store the resolved frame to avoid re-resolving later
-							modified[resolved or bar_name] = frame
-						else
-							-- Frame not present; simply log. No deferred retry.
-							dprint('modify_bars: bar not found', tostring(bar_name))
-						end
-					end
-				end
-			end
-		end
-	end
+	end)
 end
 
-
-local function update_grid_layouts()
-	local c = 0
-	for name, frame in pairs(modified) do
-		if frame and type(frame.UpdateGridLayout) == 'function' then
-			frame:UpdateGridLayout()
-			c = c + 1
-		else
-			dprint('update_grid_layouts: could not update', tostring(name))
-		end
+function apply_one(idx)
+	local frame = get_frame(map[idx])
+	if not frame or type(frame.UpdateGridLayout) ~= 'function' then return end
+	local wantV = db.y[idx] and true or false
+	local wantH = db.x[idx] and true or false
+	local changed = false
+	if stateV[idx] ~= wantV then
+		frame.addButtonsToTop = not frame.addButtonsToTop
+		stateV[idx] = wantV
+		changed = true
 	end
-	wipe(modified)
-	dprint('updated', c, 'modified action bars(s).')
+	if stateH[idx] ~= wantH then
+		frame.addButtonsToRight = not frame.addButtonsToRight
+		stateH[idx] = wantH
+		changed = true
+	end
+	-- Record what we left the flags at, and watch for Blizzard overwriting them.
+	frame.__abbgd_top = frame.addButtonsToTop
+	frame.__abbgd_right = frame.addButtonsToRight
+	watch(frame, idx)
+	if changed then frame:UpdateGridLayout() end
 end
 
+-- Called by the options panel when a checkbox changes.
+-- (vert == y axis, horiz == x axis, per the original schema)
+local function SetVert(idx, value)
+	db.y[idx] = value and true or false
+	apply_one(idx)
+end
+NS.SetVert = SetVert
 
--- pending hook retry logic removed; frames not found are logged instead
+local function SetHoriz(idx, value)
+	db.x[idx] = value and true or false
+	apply_one(idx)
+end
+NS.SetHoriz = SetHoriz
+
+local function GetVert(idx) return db.y[idx] and true or false end
+NS.GetVert = GetVert
+local function GetHoriz(idx) return db.x[idx] and true or false end
+NS.GetHoriz = GetHoriz
+
+local function reassert()
+	for i = 1, 8 do
+		stateV[i] = false -- Blizzard just (re)applied its base layout
+		stateH[i] = false
+		apply_one(i)
+	end
+end
+NS.reassert = reassert
 
 --[[===========================================================================
 	Events
 ===========================================================================]]--
 
-local ef = CreateFrame 'Frame'
-ef:RegisterEvent 'ADDON_LOADED'
-ef:RegisterEvent 'PLAYER_LOGIN'
+local ef = CreateFrame('Frame')
+ef:RegisterEvent('PLAYER_ENTERING_WORLD')
+ef:SetScript('OnEvent', function() reassert() end)
 
-ef:SetScript('OnEvent', function(self, event)
-	if event == 'ADDON_LOADED' then
-		self:UnregisterEvent 'ADDON_LOADED'
-		if db.method == 2 then
-			modify_bars()
-		end
-	else
-		if db.method == 1 then
-			modify_bars()
-		end
-		update_grid_layouts()
-	end
-end)
+-- Re-apply after the player leaves Edit Mode (Blizzard reapplies bar layouts).
+if EventRegistry and EventRegistry.RegisterCallback then
+	EventRegistry:RegisterCallback('EditMode.Exit', function() reassert() end, ef)
+end
