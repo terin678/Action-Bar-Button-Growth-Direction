@@ -4,6 +4,12 @@ To see all commits, including all alpha changes, [*go here*](https://github.com/
 
 ## Releases
 
+#### 1.1.11 (2026-06-22)
+
+- Add support for the Classic Era / 20th Anniversary client (interface 11508).
+    - These clients received the same multi-row action bar growth-direction change, and expose the same `MainActionBar`/`MultiBar*` frames and `addButtonsToTop`/`addButtonsToRight` + `UpdateGridLayout()` API the addon relies on.
+    - No Lua changes needed; the existing `MainMenuBar`↔`MainActionBar` resolver and graceful handling of missing bars already cover it.
+
 #### 1.1.10 (2026-06-14)
 
 - toc bump, no changes.
